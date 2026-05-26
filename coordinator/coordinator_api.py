@@ -42,13 +42,6 @@ async def global_retrieve(drug_id: str):
     ]
     raw_responses = await asyncio.gather(*tasks)
 
-    all_targets = []
-    for response in raw_responses:
-        if response.get("status") == "success":
-            all_targets.extend(response.get("targets", []))
-
-    aggregated_targets = list(set(all_targets))
-
     available_clients = []
     missing_clients = []
     for response in raw_responses:
@@ -59,12 +52,23 @@ async def global_retrieve(drug_id: str):
         elif status == "failed_or_timeout":
             missing_clients.append(client_id)
 
+    completeness_score = f"{len(available_clients)}/{len(CLIENT_URLS)}"
+
+    evidence_paths = []
+    for response in raw_responses:
+        if response.get("status") == "success":
+            for target in response.get("targets", []):
+                evidence_paths.append(
+                    {"client_id": response["client_id"], "path": f"{drug_id} -> {target}"}
+                )
+
     return {
         "query": drug_id,
+        "completeness_score": completeness_score,
         "available_clients": available_clients,
         "missing_clients": missing_clients,
-        "aggregated_targets_count": len(aggregated_targets),
-        "aggregated_targets": aggregated_targets,
+        "evidence_paths_count": len(evidence_paths),
+        "evidence_paths": evidence_paths,
         "raw_responses": raw_responses,
     }
 
