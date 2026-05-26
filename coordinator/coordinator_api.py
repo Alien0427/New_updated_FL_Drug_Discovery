@@ -1,7 +1,6 @@
 """Central coordinator for federated drug-target graph retrieval."""
 
 import asyncio
-import logging
 import sys
 import uuid
 from pathlib import Path
@@ -14,10 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from coordinator.coordinator_db import check_if_duplicate
-from ledger.ledger_manager import log_update
-
-logging.basicConfig(level=logging.INFO)
+from coordinator.coordinator_db import check_if_duplicate, log_to_ledger
 
 app = FastAPI()
 
@@ -31,7 +27,6 @@ CLIENT_URLS = [
 
 
 async def fetch_client_data(client, url, drug_id, timeout=2.0):
-    """Fetch targets from one lab client with a strict timeout."""
     target_url = f"{url}/retrieve?drug_id={drug_id}"
 
     try:
@@ -50,7 +45,6 @@ async def fetch_client_data(client, url, drug_id, timeout=2.0):
 
 @app.get("/global_retrieve")
 async def global_retrieve(drug_id: str):
-    """Query all lab clients in parallel and aggregate successful targets."""
     query_id = str(uuid.uuid4())
 
     tasks = [
@@ -58,28 +52,6 @@ async def global_retrieve(drug_id: str):
         for index, url in enumerate(CLIENT_URLS, start=1)
     ]
     raw_responses = await asyncio.gather(*tasks)
-
-    for response in raw_responses:
-        update_id = response.get("update_id")
-        client_id = response.get("client_id", "unknown")
-
-        if update_id:
-            is_duplicate = await asyncio.to_thread(
-                check_if_duplicate, update_id, LEDGER_DB_PATH
-            )
-            logging.info(
-                "Client %s Update %s duplicate status: %s",
-                client_id,
-                update_id,
-                is_duplicate,
-            )
-
-        log_update(
-            update_id=f"{query_id}_{client_id}",
-            query_id=query_id,
-            client_id=client_id,
-            status=response["status"],
-        )
 
     available_clients = []
     missing_clients = []
@@ -95,10 +67,40 @@ async def global_retrieve(drug_id: str):
 
     evidence_paths = []
     for response in raw_responses:
+        update_id = response.get("update_id")
+        client_id = response.get("client_id", "unknown")
+
+        if not update_id:
+            continue
+
+        is_duplicate = await asyncio.to_thread(
+            check_if_duplicate, update_id, LEDGER_DB_PATH
+        )
+
+        if is_duplicate:
+            await asyncio.to_thread(
+                log_to_ledger,
+                query_id,
+                client_id,
+                update_id,
+                "duplicate_ignored",
+                LEDGER_DB_PATH,
+            )
+            continue
+
+        await asyncio.to_thread(
+            log_to_ledger,
+            query_id,
+            client_id,
+            update_id,
+            "update_committed",
+            LEDGER_DB_PATH,
+        )
+
         if response.get("status") == "success":
             for target in response.get("targets", []):
                 evidence_paths.append(
-                    {"client_id": response["client_id"], "path": f"{drug_id} -> {target}"}
+                    {"client_id": client_id, "path": f"{drug_id} -> {target}"}
                 )
 
     return {
