@@ -3,6 +3,7 @@
 import argparse
 from contextlib import asynccontextmanager
 import hashlib
+import random
 import uuid
 
 import networkx as nx
@@ -11,11 +12,30 @@ import torch
 import torch.nn as nn
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from sklearn.metrics import f1_score, precision_score, recall_score
 
 G = None
 CLIENT_NAME = "Unknown"
 COORDINATOR_BASE_URL = "http://localhost:8000"
 MODEL_VERSION = "v1.0.0"
+
+NODE_TO_IDX: dict = {}
+NUM_NODES = 0
+EMBEDDING_DIM = 64
+GLOBAL_EMBEDDING_VOCAB_SIZE = 100_000
+
+POSITIVE_TRAIN_EDGES = 256
+HOLDOUT_EDGES = 64
+TRAINING_EPOCHS = 2
+TOP_K = 50
+
+
+def load_client_graph(graph_path: str) -> None:
+    """Load the client graph and build the node-to-index mapping for embeddings."""
+    global G, NODE_TO_IDX, NUM_NODES
+    G = nx.read_graphml(graph_path)
+    NODE_TO_IDX = {node: index for index, node in enumerate(G.nodes())}
+    NUM_NODES = len(NODE_TO_IDX)
 
 
 class ClientRuntimeState:
@@ -39,27 +59,34 @@ app = FastAPI(lifespan=lifespan)
 
 
 class LinkPredictor(nn.Module):
-    """Lightweight MLP for simulated federated link prediction."""
+    """Embedding-based MLP for graph link prediction over drug-target nodes."""
 
-    def __init__(self) -> None:
+    def __init__(self, embedding_dim: int = EMBEDDING_DIM) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(16, 8),
+        self.embeddings = nn.Embedding(
+            num_embeddings=GLOBAL_EMBEDDING_VOCAB_SIZE,
+            embedding_dim=embedding_dim,
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(embedding_dim * 2, 64),
             nn.ReLU(),
-            nn.Linear(8, 1),
-            nn.Sigmoid(),
+            nn.Linear(64, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    def forward(self, drug_idx: torch.Tensor, target_idx: torch.Tensor) -> torch.Tensor:
+        drug_emb = self.embeddings(drug_idx.long())
+        target_emb = self.embeddings(target_idx.long())
+        combined = torch.cat([drug_emb, target_emb], dim=-1)
+        return self.mlp(combined)
 
     def predict_score(self, drug_idx: int, target_idx: int) -> float:
-        """Return a prototype link probability for one drug-target pair."""
-        del drug_idx, target_idx
-        pair_features = torch.randn(1, 16)
-        hidden = self.net[1](self.net[0](pair_features))
-        logits = self.net[2](hidden)
-        probability = torch.sigmoid(logits)
+        """Return the link probability for one drug-target index pair."""
+        self.eval()
+        with torch.no_grad():
+            drug_tensor = torch.tensor([drug_idx], dtype=torch.long)
+            target_tensor = torch.tensor([target_idx], dtype=torch.long)
+            logit = self.forward(drug_tensor, target_tensor)
+            probability = torch.sigmoid(logit)
         return float(probability.item())
 
 
@@ -87,26 +114,137 @@ def calculate_local_confidence(evidence_paths_count: int) -> float:
     return round(min(0.99, 0.50 + (evidence_paths_count * 0.005)), 2)
 
 
-def train_local_model(drug_id: str) -> LinkPredictor:
-    """Run a dummy 1-epoch local training loop and return the trained model."""
+def _sample_negative_edges(sample_count: int, rng: random.Random) -> list[tuple]:
+    """Sample random node pairs that do not share an edge in the graph."""
+    nodes = list(NODE_TO_IDX.keys())
+    negative_edges: list[tuple] = []
+    attempts = 0
+    max_attempts = sample_count * 20
+
+    while len(negative_edges) < sample_count and attempts < max_attempts:
+        attempts += 1
+        source = rng.choice(nodes)
+        destination = rng.choice(nodes)
+        if source == destination or G.has_edge(source, destination):
+            continue
+        negative_edges.append((source, destination))
+
+    return negative_edges
+
+
+def _edges_to_index_tensors(edge_pairs: list[tuple]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert node-name edge pairs to drug/target index tensors for the model."""
+    drug_indices = [NODE_TO_IDX[source] for source, _ in edge_pairs]
+    target_indices = [NODE_TO_IDX[destination] for _, destination in edge_pairs]
+    return (
+        torch.tensor(drug_indices, dtype=torch.long),
+        torch.tensor(target_indices, dtype=torch.long),
+    )
+
+
+def _evaluate_model(
+    model: LinkPredictor,
+    holdout_positive: list[tuple],
+    holdout_negative: list[tuple],
+) -> dict:
+    """Compute precision, recall, F1, and Precision@K on a holdout edge set."""
+    evaluation_edges = holdout_positive + holdout_negative
+    if not evaluation_edges:
+        return {"precision": 0.0, "recall": 0.0, "f1_score": 0.0, "top_50_precision": 0.0}
+
+    y_true = [1.0] * len(holdout_positive) + [0.0] * len(holdout_negative)
+    drug_tensor, target_tensor = _edges_to_index_tensors(evaluation_edges)
+
+    model.eval()
+    with torch.no_grad():
+        logits = model(drug_tensor, target_tensor).squeeze(-1)
+        probabilities = torch.sigmoid(logits).tolist()
+
+    if isinstance(probabilities, float):
+        probabilities = [probabilities]
+
+    y_pred = [1.0 if probability >= 0.5 else 0.0 for probability in probabilities]
+
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+
+    ranked = sorted(zip(probabilities, y_true), key=lambda pair: pair[0], reverse=True)
+    top_k = ranked[: min(TOP_K, len(ranked))]
+    if top_k:
+        p_at_k = sum(label for _, label in top_k) / len(top_k)
+    else:
+        p_at_k = 0.0
+
+    return {
+        "precision": round(float(precision), 3),
+        "recall": round(float(recall), 3),
+        "f1_score": round(float(f1), 3),
+        "top_50_precision": round(float(p_at_k), 3),
+    }
+
+
+def train_model(drug_id: str) -> tuple[LinkPredictor, dict]:
+    """Train the link predictor on real graph edges and return it with metrics."""
     seed = abs(hash(drug_id)) % (2**32)
     torch.manual_seed(seed)
+    rng = random.Random(seed)
 
     model = LinkPredictor()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    criterion = nn.BCELoss()
 
-    features = torch.randn(32, 16)
-    labels = torch.randint(0, 2, (32, 1)).float()
+    all_edges = list(G.edges())
+    if not all_edges or NUM_NODES == 0:
+        return model, {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1_score": 0.0,
+            "top_50_precision": 0.0,
+        }
+
+    rng.shuffle(all_edges)
+    positive_train = all_edges[:POSITIVE_TRAIN_EDGES]
+    holdout_positive = all_edges[POSITIVE_TRAIN_EDGES : POSITIVE_TRAIN_EDGES + HOLDOUT_EDGES]
+
+    negative_pool = _sample_negative_edges(len(positive_train) + HOLDOUT_EDGES, rng)
+    negative_train = negative_pool[: len(positive_train)]
+    holdout_negative = negative_pool[len(positive_train) :]
+
+    train_edges = positive_train + negative_train
+    train_labels = [1.0] * len(positive_train) + [0.0] * len(negative_train)
+    if not train_edges:
+        return model, {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1_score": 0.0,
+            "top_50_precision": 0.0,
+        }
+
+    drug_tensor, target_tensor = _edges_to_index_tensors(train_edges)
+    label_tensor = torch.tensor(train_labels, dtype=torch.float32)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    criterion = nn.BCEWithLogitsLoss()
+
+    print(
+        f"[ML Training] {CLIENT_NAME} | drug={drug_id} | nodes={NUM_NODES} | "
+        f"train_edges={len(train_edges)} (pos={len(positive_train)}, neg={len(negative_train)})"
+    )
 
     model.train()
-    optimizer.zero_grad()
-    predictions = model(features)
-    loss = criterion(predictions, labels)
-    loss.backward()
-    optimizer.step()
+    for epoch in range(TRAINING_EPOCHS):
+        optimizer.zero_grad()
+        logits = model(drug_tensor, target_tensor).squeeze(-1)
+        loss = criterion(logits, label_tensor)
+        loss.backward()
+        optimizer.step()
+        print(
+            f"[ML Training] {CLIENT_NAME} epoch {epoch + 1}/{TRAINING_EPOCHS} "
+            f"BCE loss={loss.item():.4f}"
+        )
 
-    return model
+    metrics = _evaluate_model(model, holdout_positive, holdout_negative)
+    print(f"[ML Training] {CLIENT_NAME} holdout metrics: {metrics}")
+    return model, metrics
 
 
 def score_candidate_paths(
@@ -118,9 +256,12 @@ def score_candidate_paths(
     scored_paths = []
     local_model.eval()
 
+    drug_idx = NODE_TO_IDX.get(drug_id, 0)
+
     with torch.no_grad():
         for target in candidate_targets:
-            score = local_model.predict_score(0, 1)
+            target_idx = NODE_TO_IDX.get(target, 0)
+            score = local_model.predict_score(drug_idx, target_idx)
             if score > 0.5:
                 scored_paths.append(
                     {
@@ -181,8 +322,10 @@ def retrieve(drug_id: str) -> dict:
             "without a recovered baseline checkpoint."
         )
 
-    local_model = train_local_model(drug_id)
+    print(f"[Retrieve] {CLIENT_NAME} link-prediction training started for {drug_id}")
+    local_model, metrics = train_model(drug_id)
     model_weights = state_dict_to_lists(local_model.state_dict())
+    print(f"[Retrieve] {CLIENT_NAME} training complete for {drug_id}")
 
     if drug_id not in G:
         scored_paths: list = []
@@ -196,6 +339,7 @@ def retrieve(drug_id: str) -> dict:
             "model_weights": model_weights,
             "batch_hash": compute_batch_hash(scored_paths),
             "local_confidence": local_confidence,
+            "metrics": metrics,
             "response_id": response_id,
             "checkpoint_path": client_checkpoint_path(),
             "model_version": MODEL_VERSION,
@@ -215,6 +359,7 @@ def retrieve(drug_id: str) -> dict:
         "model_weights": model_weights,
         "batch_hash": compute_batch_hash(scored_paths),
         "local_confidence": local_confidence,
+        "metrics": metrics,
         "response_id": response_id,
         "checkpoint_path": client_checkpoint_path(),
         "model_version": MODEL_VERSION,
@@ -230,7 +375,7 @@ if __name__ == "__main__":
     parser.add_argument("--name", type=str, default="Client_1")
     args = parser.parse_args()
 
-    G = nx.read_graphml(args.file)
+    load_client_graph(args.file)
     CLIENT_NAME = args.name
 
     uvicorn.run(app, host="0.0.0.0", port=args.port)

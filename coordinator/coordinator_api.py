@@ -137,7 +137,62 @@ def aggregate_models(client_weights_list: list[dict]) -> dict:
     return aggregated
 
 
-async def fetch_client_data(client: str, url: str, drug_id: str, timeout: float = 2.0) -> dict:
+CLIENT_RETRIEVE_TIMEOUT_SECONDS = 90.0
+
+
+def summarize_state_dict_lists(state_dict_lists: dict) -> dict:
+    """Return layer shapes only so API responses stay browser-safe."""
+    summary: dict = {}
+    for layer_name, tensor_values in state_dict_lists.items():
+        if not tensor_values:
+            summary[layer_name] = {"shape": [0]}
+        elif isinstance(tensor_values[0], list):
+            summary[layer_name] = {
+                "shape": [len(tensor_values), len(tensor_values[0])],
+            }
+        else:
+            summary[layer_name] = {"shape": [len(tensor_values)]}
+    return summary
+
+
+def sanitize_raw_responses_for_api(raw_responses: list[dict]) -> list[dict]:
+    """Remove huge weight tensors from client payloads returned to the browser."""
+    sanitized: list[dict] = []
+    for response in raw_responses:
+        sanitized.append({key: value for key, value in response.items() if key != "model_weights"})
+    return sanitized
+
+
+def collect_client_metrics(raw_responses: list[dict]) -> dict[str, dict]:
+    """Collect per-client link-prediction metrics for presentation."""
+    client_metrics: dict[str, dict] = {}
+    for response in raw_responses:
+        metrics = response.get("metrics")
+        client_id = response.get("client_id")
+        if client_id and metrics:
+            client_metrics[client_id] = metrics
+    return client_metrics
+
+
+def average_client_metrics(client_metrics: dict[str, dict]) -> dict:
+    """Compute federated averages of precision, recall, F1, and top-50 precision."""
+    if not client_metrics:
+        return {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1_score": 0.0,
+            "top_50_precision": 0.0,
+        }
+
+    metric_keys = ("precision", "recall", "f1_score", "top_50_precision")
+    averaged: dict[str, float] = {}
+    for metric_key in metric_keys:
+        values = [metrics[metric_key] for metrics in client_metrics.values() if metric_key in metrics]
+        averaged[metric_key] = round(sum(values) / len(values), 3) if values else 0.0
+    return averaged
+
+
+async def fetch_client_data(client: str, url: str, drug_id: str, timeout: float = CLIENT_RETRIEVE_TIMEOUT_SECONDS) -> dict:
     """Fetch drug-target evidence from one lab client with a strict timeout.
 
     Args:
@@ -349,9 +404,13 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
         "missing_clients": missing_clients,
         "evidence_paths_count": len(evidence_paths),
         "evidence_paths": evidence_paths,
-        "global_aggregated_model": global_aggregated_model,
+        "client_link_prediction_metrics": collect_client_metrics(raw_responses),
+        "federated_link_prediction_metrics": average_client_metrics(
+            collect_client_metrics(raw_responses)
+        ),
+        "global_aggregated_model": summarize_state_dict_lists(global_aggregated_model),
         "gas_optimization_metrics": gas_optimization_metrics,
-        "raw_responses": raw_responses,
+        "raw_responses": sanitize_raw_responses_for_api(raw_responses),
     }
 
 
