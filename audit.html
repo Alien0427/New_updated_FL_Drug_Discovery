@@ -56,13 +56,15 @@
                 <th>Timestamp</th>
                 <th>Query ID</th>
                 <th>Client ID</th>
-                <th>Update ID</th>
+                <th>Round</th>
+                <th>Request ID</th>
+                <th>Evidence Hash</th>
                 <th>Status</th>
               </tr>
             </thead>
             <tbody id="audit-body">
               <tr>
-                <td colspan="5" class="text-center text-muted py-4">Fetching audit data...</td>
+                <td colspan="7" class="text-center text-muted py-4">Fetching audit data...</td>
               </tr>
             </tbody>
           </table>
@@ -91,7 +93,7 @@
 
       if (!rows.length) {
         tbody.innerHTML =
-          '<tr><td colspan="5" class="text-center text-muted py-4">No ledger entries found.</td></tr>';
+          '<tr><td colspan="7" class="text-center text-muted py-4">No ledger entries found.</td></tr>';
         countLabel.textContent = "0 entries";
         return;
       }
@@ -103,9 +105,11 @@
           return `
             <tr>
               <td>${row.timestamp || ""}</td>
-              <td class="mono" title="${row.query_id || ""}">${truncate(row.query_id, 24)}</td>
+              <td class="mono" title="${row.query_id || ""}">${truncate(row.query_id, 20)}</td>
               <td>${row.client_id || ""}</td>
-              <td class="mono" title="${row.update_id || ""}">${truncate(row.update_id, 28)}</td>
+              <td>${row.round_id ?? ""}</td>
+              <td class="mono" title="${row.request_id || ""}">${truncate(row.request_id, 16)}</td>
+              <td class="mono" title="${row.evidence_hash || ""}">${truncate(row.evidence_hash, 16)}</td>
               <td><span class="badge status-badge ${badgeClass}">${row.status || ""}</span></td>
             </tr>
           `;
@@ -116,7 +120,7 @@
     async function loadAuditData() {
       const tbody = document.getElementById("audit-body");
       tbody.innerHTML =
-        '<tr><td colspan="5" class="text-center text-muted py-4">Fetching audit data...</td></tr>';
+        '<tr><td colspan="7" class="text-center text-muted py-4">Fetching audit data...</td></tr>';
 
       try {
         const response = await fetch("/audit_data?limit=100");

@@ -1,10 +1,23 @@
 """Coordinator database helpers for idempotent update processing."""
 
 import sqlite3
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 _DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "ledger" / "ledger.db"
+
+DEFAULT_MODEL_VERSION = "v1.0.0"
+DEFAULT_ROUND_ID = 1
+
+_LEDGER_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("request_id", "TEXT"),
+    ("response_id", "TEXT"),
+    ("round_id", "INTEGER DEFAULT 1"),
+    ("checkpoint_path", "TEXT"),
+    ("model_version", "TEXT"),
+    ("evidence_hash", "TEXT"),
+)
 
 
 def _resolve_db_path(db_path: str) -> str:
@@ -19,6 +32,48 @@ def _resolve_db_path(db_path: str) -> str:
     if db_path == "ledger.db":
         return str(_DEFAULT_DB_PATH)
     return db_path
+
+
+def default_checkpoint_path(client_id: str) -> str:
+    """Return the canonical on-disk checkpoint path for a federated client."""
+    slug = client_id.strip().lower().replace(" ", "_")
+    return f"checkpoints/{slug}.pt"
+
+
+def init_ledger_db(db_path: str = "ledger.db") -> None:
+    """Create or migrate the checkpoint ledger to the extended schema."""
+    resolved_path = _resolve_db_path(db_path)
+    Path(resolved_path).parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(resolved_path, timeout=30.0) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS checkpoint_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                update_id TEXT UNIQUE,
+                query_id TEXT,
+                client_id TEXT,
+                status TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                request_id TEXT,
+                response_id TEXT,
+                round_id INTEGER DEFAULT 1,
+                checkpoint_path TEXT,
+                model_version TEXT,
+                evidence_hash TEXT
+            )
+            """
+        )
+
+        existing_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(checkpoint_ledger)").fetchall()
+        }
+        for column_name, column_type in _LEDGER_COLUMNS:
+            if column_name not in existing_columns:
+                conn.execute(
+                    f"ALTER TABLE checkpoint_ledger ADD COLUMN {column_name} {column_type}"
+                )
 
 
 def check_if_duplicate(update_id: str, db_path: str = "ledger.db") -> bool:
@@ -54,6 +109,13 @@ def log_to_ledger(
     update_id: str,
     status: str,
     db_path: str = "ledger.db",
+    *,
+    request_id: str | None = None,
+    response_id: str | None = None,
+    round_id: int = DEFAULT_ROUND_ID,
+    checkpoint_path: str | None = None,
+    model_version: str | None = None,
+    evidence_hash: str | None = None,
 ) -> None:
     """Append a checkpoint event to the SQLite ledger.
 
@@ -66,6 +128,12 @@ def log_to_ledger(
         update_id: Unique client update or response identifier.
         status: Ledger status such as ``update_committed`` or ``duplicate_ignored``.
         db_path: SQLite database path or ``ledger.db`` shorthand.
+        request_id: Trace id for the parallel coordinator-to-client call.
+        response_id: Client-issued response identifier.
+        round_id: Federated iteration counter for this retrieval round.
+        checkpoint_path: Archived local checkpoint location for the client.
+        model_version: PyTorch weight schema version tag.
+        evidence_hash: Integrity digest (typically the client ``batch_hash``).
 
     Returns:
         None
@@ -77,6 +145,12 @@ def log_to_ledger(
     if status == "duplicate_ignored":
         ledger_update_id = f"{update_id}::duplicate_ignored::{query_id}"
 
+    resolved_request_id = request_id or str(uuid.uuid4())
+    resolved_response_id = response_id or str(uuid.uuid4())
+    resolved_checkpoint_path = checkpoint_path or default_checkpoint_path(client_id)
+    resolved_model_version = model_version or DEFAULT_MODEL_VERSION
+    resolved_evidence_hash = evidence_hash or ""
+
     with sqlite3.connect(resolved_path, timeout=30.0) as conn:
         try:
             conn.execute(
@@ -86,11 +160,29 @@ def log_to_ledger(
                     client_id,
                     update_id,
                     status,
-                    timestamp
+                    timestamp,
+                    request_id,
+                    response_id,
+                    round_id,
+                    checkpoint_path,
+                    model_version,
+                    evidence_hash
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (query_id, client_id, ledger_update_id, status, timestamp),
+                (
+                    query_id,
+                    client_id,
+                    ledger_update_id,
+                    status,
+                    timestamp,
+                    resolved_request_id,
+                    resolved_response_id,
+                    round_id,
+                    resolved_checkpoint_path,
+                    resolved_model_version,
+                    resolved_evidence_hash,
+                ),
             )
         except sqlite3.IntegrityError:
             return
@@ -104,7 +196,19 @@ def get_audit_trail(limit: int = 100, db_path: str = "ledger.db") -> list[dict]:
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
             """
-            SELECT id, query_id, client_id, update_id, status, timestamp
+            SELECT
+                id,
+                query_id,
+                client_id,
+                update_id,
+                status,
+                timestamp,
+                request_id,
+                response_id,
+                round_id,
+                checkpoint_path,
+                model_version,
+                evidence_hash
             FROM checkpoint_ledger
             ORDER BY timestamp DESC
             LIMIT ?
@@ -122,7 +226,13 @@ def get_latest_client_checkpoint(client_name: str, db_path: str = "ledger.db") -
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
             """
-            SELECT update_id, timestamp
+            SELECT
+                update_id,
+                timestamp,
+                checkpoint_path,
+                model_version,
+                evidence_hash,
+                round_id
             FROM checkpoint_ledger
             WHERE client_id = ?
               AND status = 'update_committed'

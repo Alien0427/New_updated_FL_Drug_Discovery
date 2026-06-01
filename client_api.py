@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException
 G = None
 CLIENT_NAME = "Unknown"
 COORDINATOR_BASE_URL = "http://localhost:8000"
+MODEL_VERSION = "v1.0.0"
 
 
 class ClientRuntimeState:
@@ -55,6 +56,12 @@ class LinkPredictor(nn.Module):
 
 def state_dict_to_lists(state_dict: dict) -> dict:
     return {key: tensor.detach().cpu().tolist() for key, tensor in state_dict.items()}
+
+
+def client_checkpoint_path() -> str:
+    """Return the canonical checkpoint archive path for this client node."""
+    slug = CLIENT_NAME.strip().lower().replace(" ", "_")
+    return f"checkpoints/{slug}.pt"
 
 
 def compute_batch_hash(targets: list) -> str:
@@ -137,6 +144,7 @@ def retrieve(drug_id: str) -> dict:
 
     if drug_id not in G:
         targets: list = []
+        response_id = str(uuid.uuid4())
         payload = {
             "client_id": CLIENT_NAME,
             "drug_id": drug_id,
@@ -144,11 +152,15 @@ def retrieve(drug_id: str) -> dict:
             "status": "not_found",
             "model_weights": model_weights,
             "batch_hash": compute_batch_hash(targets),
+            "response_id": response_id,
+            "checkpoint_path": client_checkpoint_path(),
+            "model_version": MODEL_VERSION,
         }
         payload["update_id"] = str(uuid.uuid4())
         return payload
 
     targets = list(G.neighbors(drug_id))
+    response_id = str(uuid.uuid4())
     payload = {
         "client_id": CLIENT_NAME,
         "drug_id": drug_id,
@@ -156,6 +168,9 @@ def retrieve(drug_id: str) -> dict:
         "status": "success",
         "model_weights": model_weights,
         "batch_hash": compute_batch_hash(targets),
+        "response_id": response_id,
+        "checkpoint_path": client_checkpoint_path(),
+        "model_version": MODEL_VERSION,
     }
     payload["update_id"] = str(uuid.uuid4())
     return payload

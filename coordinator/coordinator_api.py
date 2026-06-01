@@ -16,9 +16,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from coordinator.coordinator_db import (
+    DEFAULT_MODEL_VERSION,
     check_if_duplicate,
+    default_checkpoint_path,
     get_audit_trail,
     get_latest_client_checkpoint,
+    init_ledger_db,
     log_to_ledger,
 )
 
@@ -35,6 +38,32 @@ CLIENT_URLS = [
 
 UNBATCHED_GAS_PER_TARGET = 10
 BATCHED_GAS_PER_CLIENT = 50
+
+_FEDERATED_ROUND_ID = 0
+
+init_ledger_db(LEDGER_DB_PATH)
+
+
+def _next_round_id() -> int:
+    """Increment and return the federated retrieval round counter."""
+    global _FEDERATED_ROUND_ID
+    _FEDERATED_ROUND_ID += 1
+    return _FEDERATED_ROUND_ID
+
+
+def _ledger_fields_from_response(response: dict, round_id: int) -> dict:
+    """Map a client or synthetic coordinator response to extended ledger columns."""
+    client_id = response.get("client_id", "unknown")
+    batch_hash = response.get("batch_hash") or response.get("evidence_hash") or ""
+
+    return {
+        "request_id": response.get("request_id"),
+        "response_id": response.get("response_id") or response.get("update_id"),
+        "round_id": response.get("round_id", round_id),
+        "checkpoint_path": response.get("checkpoint_path") or default_checkpoint_path(client_id),
+        "model_version": response.get("model_version", DEFAULT_MODEL_VERSION),
+        "evidence_hash": batch_hash,
+    }
 
 
 def calculate_gas_optimization_metrics(
@@ -93,18 +122,26 @@ async def fetch_client_data(client: str, url: str, drug_id: str, timeout: float 
         the client is unreachable or exceeds the timeout.
     """
     target_url = f"{url}/retrieve?drug_id={drug_id}"
+    request_id = str(uuid.uuid4())
 
     try:
         async with httpx.AsyncClient() as http_client:
             response = await http_client.get(target_url, timeout=timeout)
             response.raise_for_status()
-            return response.json()
+            payload = response.json()
+            payload["request_id"] = request_id
+            return payload
     except (httpx.TimeoutException, httpx.RequestError, httpx.HTTPStatusError):
         return {
             "client_id": client,
             "drug_id": drug_id,
             "targets": [],
             "status": "failed_or_timeout",
+            "request_id": request_id,
+            "response_id": str(uuid.uuid4()),
+            "checkpoint_path": default_checkpoint_path(client),
+            "model_version": DEFAULT_MODEL_VERSION,
+            "batch_hash": "",
         }
 
 
@@ -124,6 +161,7 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
         available and missing clients, evidence paths, and raw client responses.
     """
     query_id = str(uuid.uuid4())
+    round_id = _next_round_id()
 
     tasks = [
         fetch_client_data(f"Client_{index}", url, drug_id)
@@ -159,6 +197,8 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
         client_id = response.get("client_id", "unknown")
         status = response.get("status", "unknown")
 
+        ledger_fields = _ledger_fields_from_response(response, round_id)
+
         if not update_id:
             timeout_update_id = f"{query_id}_{client_id}_{status}"
             await asyncio.to_thread(
@@ -168,6 +208,7 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
                 timeout_update_id,
                 status,
                 LEDGER_DB_PATH,
+                **ledger_fields,
             )
             continue
 
@@ -183,6 +224,7 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
                 update_id,
                 "duplicate_ignored",
                 LEDGER_DB_PATH,
+                **ledger_fields,
             )
             continue
 
@@ -193,6 +235,7 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
             update_id,
             "update_committed",
             LEDGER_DB_PATH,
+            **ledger_fields,
         )
 
         if response.get("status") == "success":
@@ -223,6 +266,7 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
     return {
         "query": drug_id,
         "query_id": query_id,
+        "round_id": round_id,
         "completeness_score": completeness_score,
         "available_clients": available_clients,
         "missing_clients": missing_clients,
@@ -256,6 +300,10 @@ async def client_checkpoint(client_name: str) -> dict:
         "status": "found",
         "last_update_id": checkpoint["update_id"],
         "timestamp": checkpoint["timestamp"],
+        "checkpoint_path": checkpoint.get("checkpoint_path"),
+        "model_version": checkpoint.get("model_version"),
+        "evidence_hash": checkpoint.get("evidence_hash"),
+        "round_id": checkpoint.get("round_id"),
     }
 
 
