@@ -9,16 +9,18 @@ import httpx
 import torch
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from coordinator.coordinator_db import check_if_duplicate, log_to_ledger
+from coordinator.coordinator_db import check_if_duplicate, get_audit_trail, log_to_ledger
 
 app = FastAPI()
 
 LEDGER_DB_PATH = str(PROJECT_ROOT / "ledger" / "ledger.db")
+AUDIT_HTML_PATH = PROJECT_ROOT / "audit.html"
 
 CLIENT_URLS = [
     "http://localhost:8001",
@@ -174,6 +176,19 @@ async def global_retrieve(drug_id: str) -> dict:
         "global_aggregated_model": global_aggregated_model,
         "raw_responses": raw_responses,
     }
+
+
+@app.get("/audit_data")
+async def audit_data(limit: int = 100) -> list[dict]:
+    """Return recent checkpoint ledger rows as JSON."""
+    return await asyncio.to_thread(get_audit_trail, limit, LEDGER_DB_PATH)
+
+
+@app.get("/audit", response_class=HTMLResponse)
+async def audit_dashboard() -> HTMLResponse:
+    """Serve the read-only audit ledger dashboard."""
+    html_content = AUDIT_HTML_PATH.read_text(encoding="utf-8")
+    return HTMLResponse(content=html_content)
 
 
 if __name__ == "__main__":

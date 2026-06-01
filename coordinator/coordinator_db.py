@@ -94,3 +94,21 @@ def log_to_ledger(
             )
         except sqlite3.IntegrityError:
             return
+
+
+def get_audit_trail(limit: int = 100, db_path: str = "ledger.db") -> list[dict]:
+    """Fetch recent checkpoint ledger rows for the audit dashboard."""
+    resolved_path = _resolve_db_path(db_path)
+
+    with sqlite3.connect(resolved_path, timeout=30.0) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            """
+            SELECT id, query_id, client_id, update_id, status, timestamp
+            FROM checkpoint_ledger
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
