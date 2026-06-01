@@ -5,6 +5,31 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+try:
+    import redis as redis_lib
+except ImportError:
+    redis_lib = None
+
+redis_client = None
+REDIS_AVAILABLE = False
+
+if redis_lib is not None:
+    try:
+        redis_client = redis_lib.Redis(
+            host="localhost",
+            port=6379,
+            decode_responses=True,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
+        redis_client.ping()
+        REDIS_AVAILABLE = True
+    except Exception:
+        redis_client = None
+        REDIS_AVAILABLE = False
+
+REDIS_LEDGER_STREAM = "federated:ledger:stream"
+
 _DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "ledger" / "ledger.db"
 
 DEFAULT_MODEL_VERSION = "v1.0.0"
@@ -114,6 +139,41 @@ def check_if_duplicate(update_id: str, db_path: str = "ledger.db") -> bool:
     return row is not None
 
 
+def _mirror_ledger_event_to_redis(
+    query_id: str,
+    client_id: str,
+    update_id: str,
+    status: str,
+    timestamp: str,
+    request_id: str,
+    response_id: str,
+    round_id: int,
+    checkpoint_path: str,
+    model_version: str,
+    evidence_hash: str,
+) -> None:
+    """Append a ledger row to the optional Redis Stream mirror (best-effort)."""
+    if not REDIS_AVAILABLE or redis_client is None:
+        return
+    try:
+        stream_payload = {
+            "query_id": str(query_id),
+            "client_id": str(client_id),
+            "update_id": str(update_id),
+            "status": str(status),
+            "timestamp": str(timestamp),
+            "request_id": str(request_id),
+            "response_id": str(response_id),
+            "round_id": str(round_id),
+            "checkpoint_path": str(checkpoint_path),
+            "model_version": str(model_version),
+            "evidence_hash": str(evidence_hash),
+        }
+        redis_client.xadd(REDIS_LEDGER_STREAM, stream_payload)
+    except Exception:
+        pass
+
+
 def log_to_ledger(
     query_id: str,
     client_id: str,
@@ -200,6 +260,20 @@ def log_to_ledger(
             )
         except sqlite3.IntegrityError:
             return
+
+    _mirror_ledger_event_to_redis(
+        query_id,
+        client_id,
+        ledger_update_id,
+        status,
+        timestamp,
+        resolved_request_id,
+        resolved_response_id,
+        round_id,
+        resolved_checkpoint_path,
+        resolved_model_version,
+        resolved_evidence_hash,
+    )
 
 
 def get_audit_trail(limit: int = 100, db_path: str = "ledger.db") -> list[dict]:
