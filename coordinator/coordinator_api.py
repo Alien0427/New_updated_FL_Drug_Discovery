@@ -176,19 +176,28 @@ def collect_client_metrics(raw_responses: list[dict]) -> dict[str, dict]:
     return client_metrics
 
 
-def average_client_metrics(client_metrics: dict[str, dict]) -> dict:
-    """Compute federated averages of precision, recall, F1, and top-50 precision."""
-    if not client_metrics:
-        return {
+def average_client_metrics(
+    client_metrics: dict[str, dict],
+    task_type: str = "classification",
+) -> dict:
+    """Compute federated averages of classification or regression holdout metrics."""
+    if task_type == "regression":
+        default_keys = ("mse", "r2")
+        defaults = {"mse": 0.0, "r2": 0.0}
+    else:
+        default_keys = ("precision", "recall", "f1_score", "top_50_precision")
+        defaults = {
             "precision": 0.0,
             "recall": 0.0,
             "f1_score": 0.0,
             "top_50_precision": 0.0,
         }
 
-    metric_keys = ("precision", "recall", "f1_score", "top_50_precision")
+    if not client_metrics:
+        return defaults
+
     averaged: dict[str, float] = {}
-    for metric_key in metric_keys:
+    for metric_key in default_keys:
         values = [metrics[metric_key] for metrics in client_metrics.values() if metric_key in metrics]
         averaged[metric_key] = round(sum(values) / len(values), 3) if values else 0.0
     return averaged
@@ -218,7 +227,13 @@ def get_ledger_storage_metrics() -> dict:
     }
 
 
-async def fetch_client_data(client: str, url: str, drug_id: str, timeout: float = CLIENT_RETRIEVE_TIMEOUT_SECONDS) -> dict:
+async def fetch_client_data(
+    client: str,
+    url: str,
+    drug_id: str,
+    task_type: str = "classification",
+    timeout: float = CLIENT_RETRIEVE_TIMEOUT_SECONDS,
+) -> dict:
     """Fetch drug-target evidence from one lab client with a strict timeout.
 
     Args:
@@ -231,7 +246,7 @@ async def fetch_client_data(client: str, url: str, drug_id: str, timeout: float 
         Parsed JSON response from the client, or a synthetic failure payload when
         the client is unreachable or exceeds the timeout.
     """
-    target_url = f"{url}/retrieve?drug_id={drug_id}"
+    target_url = f"{url}/retrieve?drug_id={drug_id}&task_type={task_type}"
     request_id = str(uuid.uuid4())
 
     try:
@@ -256,7 +271,11 @@ async def fetch_client_data(client: str, url: str, drug_id: str, timeout: float 
 
 
 @app.get("/global_retrieve")
-async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
+async def global_retrieve(
+    drug_id: str,
+    mode: str = "aware",
+    task_type: str = "classification",
+) -> dict:
     """Query all lab clients in parallel and return a partial federated answer.
 
     The coordinator aggregates evidence from available clients, records ledger
@@ -265,6 +284,7 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
 
     Args:
         drug_id: Drug identifier shared across all client queries.
+        task_type: ``classification`` for link prediction or ``regression`` for DeepDTA affinity.
 
     Returns:
         Federated retrieval payload containing query metadata, completeness score,
@@ -287,8 +307,14 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
         evidence_hash="",
     )
 
+    if task_type not in ("classification", "regression"):
+        raise HTTPException(
+            status_code=400,
+            detail="task_type must be 'classification' or 'regression'",
+        )
+
     tasks = [
-        fetch_client_data(f"Client_{index}", url, drug_id)
+        fetch_client_data(f"Client_{index}", url, drug_id, task_type=task_type)
         for index, url in enumerate(CLIENT_URLS, start=1)
     ]
     raw_responses = await asyncio.gather(*tasks)
@@ -431,6 +457,7 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
 
     return {
         "query": drug_id,
+        "task_type": task_type,
         "query_id": query_id,
         "round_id": round_id,
         "completeness_score": completeness_score,
@@ -441,7 +468,8 @@ async def global_retrieve(drug_id: str, mode: str = "aware") -> dict:
         "evidence_paths": evidence_paths,
         "client_link_prediction_metrics": collect_client_metrics(raw_responses),
         "federated_link_prediction_metrics": average_client_metrics(
-            collect_client_metrics(raw_responses)
+            collect_client_metrics(raw_responses),
+            task_type=task_type,
         ),
         "global_aggregated_model": summarize_state_dict_lists(global_aggregated_model),
         "gas_optimization_metrics": gas_optimization_metrics,

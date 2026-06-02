@@ -12,7 +12,13 @@ import torch
 import torch.nn as nn
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from sklearn.metrics import f1_score, precision_score, recall_score
+from sklearn.metrics import (
+    f1_score,
+    mean_squared_error,
+    precision_score,
+    r2_score,
+    recall_score,
+)
 
 G = None
 CLIENT_NAME = "Unknown"
@@ -28,6 +34,10 @@ POSITIVE_TRAIN_EDGES = 256
 HOLDOUT_EDGES = 64
 TRAINING_EPOCHS = 2
 TOP_K = 50
+
+REGRESSION_HIGH_AFFINITY = (5.0, 10.0)
+REGRESSION_LOW_AFFINITY = (0.0, 3.0)
+REGRESSION_SCORE_THRESHOLD = 5.0
 
 
 def load_client_graph(graph_path: str) -> None:
@@ -59,10 +69,15 @@ app = FastAPI(lifespan=lifespan)
 
 
 class LinkPredictor(nn.Module):
-    """Embedding-based MLP for graph link prediction over drug-target nodes."""
+    """Embedding-based MLP for link classification or DeepDTA-style affinity regression."""
 
-    def __init__(self, embedding_dim: int = EMBEDDING_DIM) -> None:
+    def __init__(
+        self,
+        embedding_dim: int = EMBEDDING_DIM,
+        task_type: str = "classification",
+    ) -> None:
         super().__init__()
+        self.task_type = task_type
         self.embeddings = nn.Embedding(
             num_embeddings=GLOBAL_EMBEDDING_VOCAB_SIZE,
             embedding_dim=embedding_dim,
@@ -80,14 +95,15 @@ class LinkPredictor(nn.Module):
         return self.mlp(combined)
 
     def predict_score(self, drug_idx: int, target_idx: int) -> float:
-        """Return the link probability for one drug-target index pair."""
+        """Return a classification probability or raw affinity prediction."""
         self.eval()
         with torch.no_grad():
             drug_tensor = torch.tensor([drug_idx], dtype=torch.long)
             target_tensor = torch.tensor([target_idx], dtype=torch.long)
             logit = self.forward(drug_tensor, target_tensor)
-            probability = torch.sigmoid(logit)
-        return float(probability.item())
+            if self.task_type == "regression":
+                return float(logit.item())
+            return float(torch.sigmoid(logit).item())
 
 
 def state_dict_to_lists(state_dict: dict) -> dict:
@@ -132,6 +148,27 @@ def _sample_negative_edges(sample_count: int, rng: random.Random) -> list[tuple]
     return negative_edges
 
 
+def _empty_metrics(task_type: str) -> dict:
+    """Return zeroed metrics for the active training task."""
+    if task_type == "regression":
+        return {"mse": 0.0, "r2": 0.0}
+    return {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1_score": 0.0,
+        "top_50_precision": 0.0,
+    }
+
+
+def _affinity_labels(edge_count: int, is_positive: bool, task_type: str, rng: random.Random) -> list[float]:
+    """Build binary or mock DeepDTA affinity labels for an edge batch."""
+    if task_type == "regression":
+        low, high = REGRESSION_HIGH_AFFINITY if is_positive else REGRESSION_LOW_AFFINITY
+        return [rng.uniform(low, high) for _ in range(edge_count)]
+    label_value = 1.0 if is_positive else 0.0
+    return [label_value] * edge_count
+
+
 def _edges_to_index_tensors(edge_pairs: list[tuple]) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert node-name edge pairs to drug/target index tensors for the model."""
     drug_indices = [NODE_TO_IDX[source] for source, _ in edge_pairs]
@@ -146,30 +183,42 @@ def _evaluate_model(
     model: LinkPredictor,
     holdout_positive: list[tuple],
     holdout_negative: list[tuple],
+    task_type: str,
+    rng: random.Random,
 ) -> dict:
-    """Compute precision, recall, F1, and Precision@K on a holdout edge set."""
+    """Compute classification or DeepDTA regression metrics on a holdout edge set."""
     evaluation_edges = holdout_positive + holdout_negative
     if not evaluation_edges:
-        return {"precision": 0.0, "recall": 0.0, "f1_score": 0.0, "top_50_precision": 0.0}
+        return _empty_metrics(task_type)
 
-    y_true = [1.0] * len(holdout_positive) + [0.0] * len(holdout_negative)
+    y_true = _affinity_labels(len(holdout_positive), True, task_type, rng) + _affinity_labels(
+        len(holdout_negative), False, task_type, rng
+    )
     drug_tensor, target_tensor = _edges_to_index_tensors(evaluation_edges)
 
     model.eval()
     with torch.no_grad():
         logits = model(drug_tensor, target_tensor).squeeze(-1)
-        probabilities = torch.sigmoid(logits).tolist()
+        if task_type == "regression":
+            y_pred = logits.tolist()
+        else:
+            y_pred = torch.sigmoid(logits).tolist()
 
-    if isinstance(probabilities, float):
-        probabilities = [probabilities]
+    if isinstance(y_pred, float):
+        y_pred = [y_pred]
 
-    y_pred = [1.0 if probability >= 0.5 else 0.0 for probability in probabilities]
+    if task_type == "regression":
+        mse = mean_squared_error(y_true, y_pred)
+        r2 = r2_score(y_true, y_pred)
+        return {"mse": round(float(mse), 3), "r2": round(float(r2), 3)}
 
-    precision = precision_score(y_true, y_pred, zero_division=0)
-    recall = recall_score(y_true, y_pred, zero_division=0)
-    f1 = f1_score(y_true, y_pred, zero_division=0)
+    y_pred_binary = [1.0 if probability >= 0.5 else 0.0 for probability in y_pred]
 
-    ranked = sorted(zip(probabilities, y_true), key=lambda pair: pair[0], reverse=True)
+    precision = precision_score(y_true, y_pred_binary, zero_division=0)
+    recall = recall_score(y_true, y_pred_binary, zero_division=0)
+    f1 = f1_score(y_true, y_pred_binary, zero_division=0)
+
+    ranked = sorted(zip(y_pred, y_true), key=lambda pair: pair[0], reverse=True)
     top_k = ranked[: min(TOP_K, len(ranked))]
     if top_k:
         p_at_k = sum(label for _, label in top_k) / len(top_k)
@@ -184,22 +233,20 @@ def _evaluate_model(
     }
 
 
-def train_model(drug_id: str) -> tuple[LinkPredictor, dict]:
+def train_model(drug_id: str, task_type: str = "classification") -> tuple[LinkPredictor, dict]:
     """Train the link predictor on real graph edges and return it with metrics."""
+    if task_type not in ("classification", "regression"):
+        raise ValueError(f"Unsupported task_type: {task_type}")
+
     seed = abs(hash(drug_id)) % (2**32)
     torch.manual_seed(seed)
     rng = random.Random(seed)
 
-    model = LinkPredictor()
+    model = LinkPredictor(task_type=task_type)
 
     all_edges = list(G.edges())
     if not all_edges or NUM_NODES == 0:
-        return model, {
-            "precision": 0.0,
-            "recall": 0.0,
-            "f1_score": 0.0,
-            "top_50_precision": 0.0,
-        }
+        return model, _empty_metrics(task_type)
 
     rng.shuffle(all_edges)
     positive_train = all_edges[:POSITIVE_TRAIN_EDGES]
@@ -210,23 +257,25 @@ def train_model(drug_id: str) -> tuple[LinkPredictor, dict]:
     holdout_negative = negative_pool[len(positive_train) :]
 
     train_edges = positive_train + negative_train
-    train_labels = [1.0] * len(positive_train) + [0.0] * len(negative_train)
+    train_labels = _affinity_labels(len(positive_train), True, task_type, rng) + _affinity_labels(
+        len(negative_train), False, task_type, rng
+    )
     if not train_edges:
-        return model, {
-            "precision": 0.0,
-            "recall": 0.0,
-            "f1_score": 0.0,
-            "top_50_precision": 0.0,
-        }
+        return model, _empty_metrics(task_type)
 
     drug_tensor, target_tensor = _edges_to_index_tensors(train_edges)
     label_tensor = torch.tensor(train_labels, dtype=torch.float32)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    criterion = nn.BCEWithLogitsLoss()
+    if task_type == "regression":
+        criterion = nn.MSELoss()
+        loss_name = "MSE"
+    else:
+        criterion = nn.BCEWithLogitsLoss()
+        loss_name = "BCE"
 
     print(
-        f"[ML Training] {CLIENT_NAME} | drug={drug_id} | nodes={NUM_NODES} | "
+        f"[ML Training] {CLIENT_NAME} | task={task_type} | drug={drug_id} | nodes={NUM_NODES} | "
         f"train_edges={len(train_edges)} (pos={len(positive_train)}, neg={len(negative_train)})"
     )
 
@@ -239,10 +288,10 @@ def train_model(drug_id: str) -> tuple[LinkPredictor, dict]:
         optimizer.step()
         print(
             f"[ML Training] {CLIENT_NAME} epoch {epoch + 1}/{TRAINING_EPOCHS} "
-            f"BCE loss={loss.item():.4f}"
+            f"{loss_name} loss={loss.item():.4f}"
         )
 
-    metrics = _evaluate_model(model, holdout_positive, holdout_negative)
+    metrics = _evaluate_model(model, holdout_positive, holdout_negative, task_type, rng)
     print(f"[ML Training] {CLIENT_NAME} holdout metrics: {metrics}")
     return model, metrics
 
@@ -257,12 +306,17 @@ def score_candidate_paths(
     local_model.eval()
 
     drug_idx = NODE_TO_IDX.get(drug_id, 0)
+    score_threshold = (
+        REGRESSION_SCORE_THRESHOLD
+        if local_model.task_type == "regression"
+        else 0.5
+    )
 
     with torch.no_grad():
         for target in candidate_targets:
             target_idx = NODE_TO_IDX.get(target, 0)
             score = local_model.predict_score(drug_idx, target_idx)
-            if score > 0.5:
+            if score > score_threshold:
                 scored_paths.append(
                     {
                         "path": f"{drug_id} -> {target}",
@@ -306,8 +360,13 @@ def resume_from_checkpoint() -> None:
 
 
 @app.get("/retrieve")
-def retrieve(drug_id: str) -> dict:
+def retrieve(drug_id: str, task_type: str = "classification") -> dict:
     """Return local graph neighbors for a queried drug ID."""
+    if task_type not in ("classification", "regression"):
+        raise HTTPException(
+            status_code=400,
+            detail="task_type must be 'classification' or 'regression'",
+        )
     if G is None:
         raise HTTPException(status_code=503, detail="Client graph is not loaded")
 
@@ -322,8 +381,10 @@ def retrieve(drug_id: str) -> dict:
             "without a recovered baseline checkpoint."
         )
 
-    print(f"[Retrieve] {CLIENT_NAME} link-prediction training started for {drug_id}")
-    local_model, metrics = train_model(drug_id)
+    print(
+        f"[Retrieve] {CLIENT_NAME} {task_type} training started for {drug_id}"
+    )
+    local_model, metrics = train_model(drug_id, task_type=task_type)
     model_weights = state_dict_to_lists(local_model.state_dict())
     print(f"[Retrieve] {CLIENT_NAME} training complete for {drug_id}")
 
@@ -334,6 +395,7 @@ def retrieve(drug_id: str) -> dict:
         payload = {
             "client_id": CLIENT_NAME,
             "drug_id": drug_id,
+            "task_type": task_type,
             "targets": scored_paths,
             "status": "not_found",
             "model_weights": model_weights,
@@ -354,6 +416,7 @@ def retrieve(drug_id: str) -> dict:
     payload = {
         "client_id": CLIENT_NAME,
         "drug_id": drug_id,
+        "task_type": task_type,
         "targets": scored_paths,
         "status": "success",
         "model_weights": model_weights,
