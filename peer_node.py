@@ -1,13 +1,11 @@
-"""Reusable FastAPI client for local drug-target graph retrieval."""
+"""Hybrid P2P peer: local graph client and federated query initiator."""
 
 import argparse
-from contextlib import asynccontextmanager
 import hashlib
 import random
 import uuid
 
 import networkx as nx
-import requests
 import torch
 import torch.nn as nn
 import uvicorn
@@ -21,8 +19,7 @@ from sklearn.metrics import (
 )
 
 G = None
-CLIENT_NAME = "Unknown"
-COORDINATOR_BASE_URL = "http://localhost:8000"
+PEER_NAME = "Unknown"
 MODEL_VERSION = "v1.0.0"
 
 NODE_TO_IDX: dict = {}
@@ -39,33 +36,20 @@ REGRESSION_HIGH_AFFINITY = (5.0, 10.0)
 REGRESSION_LOW_AFFINITY = (0.0, 3.0)
 REGRESSION_SCORE_THRESHOLD = 5.0
 
+app = FastAPI(title="Hybrid P2P Peer Node")
 
-def load_client_graph(graph_path: str) -> None:
-    """Load the client graph and build the node-to-index mapping for embeddings."""
+
+def load_peer_graph(graph_path: str, peer_name: str | None = None) -> None:
+    """Load the peer's private graph partition and build node index mappings."""
     global G, NODE_TO_IDX, NUM_NODES
     G = nx.read_graphml(graph_path)
     NODE_TO_IDX = {node: index for index, node in enumerate(G.nodes())}
     NUM_NODES = len(NODE_TO_IDX)
-
-
-class ClientRuntimeState:
-    """In-memory state restored from the coordinator checkpoint ledger."""
-
-    def __init__(self) -> None:
-        self.last_valid_checkpoint: str | None = None
-
-
-CLIENT_STATE = ClientRuntimeState()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Run startup checkpoint recovery without deprecated FastAPI event hooks."""
-    resume_from_checkpoint()
-    yield
-
-
-app = FastAPI(lifespan=lifespan)
+    label = peer_name or "peer"
+    print(
+        f"[Peer Node] {label} loaded {graph_path}: "
+        f"{NUM_NODES} nodes, {G.number_of_edges()} edges mapped to indices"
+    )
 
 
 class LinkPredictor(nn.Module):
@@ -119,14 +103,14 @@ def summarize_state_dict(state_dict: dict) -> dict:
     return summary
 
 
-def client_checkpoint_path() -> str:
-    """Return the canonical checkpoint archive path for this client node."""
-    slug = CLIENT_NAME.strip().lower().replace(" ", "_")
+def peer_checkpoint_path() -> str:
+    """Return the canonical checkpoint archive path for this peer."""
+    slug = PEER_NAME.strip().lower().replace(" ", "_")
     return f"checkpoints/{slug}.pt"
 
 
 def compute_batch_hash(targets: list) -> str:
-    """Build an SHA-256 digest over batched targets (rollup-style integrity root)."""
+    """Build an SHA-256 digest over batched targets."""
     targets_string = ",".join(str(target) for target in targets)
     return hashlib.sha256(targets_string.encode("utf-8")).hexdigest()
 
@@ -284,7 +268,7 @@ def train_model(drug_id: str, task_type: str = "classification") -> tuple[LinkPr
         loss_name = "BCE"
 
     print(
-        f"[ML Training] {CLIENT_NAME} | task={task_type} | drug={drug_id} | nodes={NUM_NODES} | "
+        f"[ML Training] {PEER_NAME} | task={task_type} | drug={drug_id} | nodes={NUM_NODES} | "
         f"train_edges={len(train_edges)} (pos={len(positive_train)}, neg={len(negative_train)})"
     )
 
@@ -296,12 +280,12 @@ def train_model(drug_id: str, task_type: str = "classification") -> tuple[LinkPr
         loss.backward()
         optimizer.step()
         print(
-            f"[ML Training] {CLIENT_NAME} epoch {epoch + 1}/{TRAINING_EPOCHS} "
+            f"[ML Training] {PEER_NAME} epoch {epoch + 1}/{TRAINING_EPOCHS} "
             f"{loss_name} loss={loss.item():.4f}"
         )
 
     metrics = _evaluate_model(model, holdout_positive, holdout_negative, task_type, rng)
-    print(f"[ML Training] {CLIENT_NAME} holdout metrics: {metrics}")
+    print(f"[ML Training] {PEER_NAME} holdout metrics: {metrics}")
     return model, metrics
 
 
@@ -337,61 +321,7 @@ def score_candidate_paths(
     return scored_paths[:50]
 
 
-def resume_from_checkpoint() -> None:
-    """Synchronize this client with its latest committed coordinator checkpoint."""
-    checkpoint_url = f"{COORDINATOR_BASE_URL}/client_checkpoint/{CLIENT_NAME}"
-
-    try:
-        response = requests.get(checkpoint_url, timeout=5)
-        response.raise_for_status()
-        checkpoint = response.json()
-    except requests.RequestException as exc:
-        CLIENT_STATE.last_valid_checkpoint = None
-        print(
-            f"[Checkpoint Recovery] Unable to contact coordinator for node {CLIENT_NAME}: "
-            f"{exc}. Initializing without a recovered checkpoint."
-        )
-        return
-
-    last_update_id = checkpoint.get("last_update_id")
-    if last_update_id:
-        CLIENT_STATE.last_valid_checkpoint = last_update_id
-        print(
-            f"[Checkpoint Recovery] Resuming node {CLIENT_NAME}. "
-            f"Last verified committed update: {last_update_id}"
-        )
-    else:
-        CLIENT_STATE.last_valid_checkpoint = None
-        print(
-            f"[Checkpoint Recovery] No historical checkpoint found for node {CLIENT_NAME}. "
-            "Initializing fresh state."
-        )
-
-
-def _fast_graph_retrieve(drug_id: str, task_type: str) -> tuple[str, list[dict], dict]:
-    """Graph neighbor lookup only — used for load-test / demo speed (no ML training)."""
-    if drug_id not in G:
-        return "not_found", [], _empty_metrics(task_type)
-
-    neighbors = list(G.neighbors(drug_id))[:TOP_K]
-    scored_paths = [
-        {"path": f"{drug_id} -> {target}", "ml_score": 0.72}
-        for target in neighbors
-    ]
-    demo_metrics = (
-        {"mse": 0.0, "r2": 0.0}
-        if task_type == "regression"
-        else {
-            "precision": 0.6,
-            "recall": 0.6,
-            "f1_score": 0.6,
-            "top_50_precision": 0.64,
-        }
-    )
-    return "success", scored_paths, demo_metrics
-
-
-def _build_retrieve_payload(
+def _build_local_payload(
     *,
     drug_id: str,
     task_type: str,
@@ -401,10 +331,11 @@ def _build_retrieve_payload(
     state_dict: dict,
     include_weights: bool,
 ) -> dict:
-    """Assemble client JSON; omit full tensors unless the coordinator requested them."""
+    """Assemble the local peer retrieval response."""
     response_id = str(uuid.uuid4())
     payload = {
-        "client_id": CLIENT_NAME,
+        "peer_id": PEER_NAME,
+        "client_id": PEER_NAME,
         "drug_id": drug_id,
         "task_type": task_type,
         "targets": scored_paths,
@@ -413,7 +344,7 @@ def _build_retrieve_payload(
         "local_confidence": calculate_local_confidence(len(scored_paths)),
         "metrics": metrics,
         "response_id": response_id,
-        "checkpoint_path": client_checkpoint_path(),
+        "checkpoint_path": peer_checkpoint_path(),
         "model_version": MODEL_VERSION,
         "update_id": str(uuid.uuid4()),
     }
@@ -424,56 +355,27 @@ def _build_retrieve_payload(
     return payload
 
 
-@app.get("/retrieve")
-def retrieve(
+def run_local_retrieve(
     drug_id: str,
     task_type: str = "classification",
-    include_weights: bool = False,
-    fast: bool = False,
+    include_weights: bool = True,
 ) -> dict:
-    """Return local graph neighbors for a queried drug ID."""
+    """Execute local graph retrieval and model training for one drug query."""
     if task_type not in ("classification", "regression"):
         raise HTTPException(
             status_code=400,
             detail="task_type must be 'classification' or 'regression'",
         )
     if G is None:
-        raise HTTPException(status_code=503, detail="Client graph is not loaded")
+        raise HTTPException(status_code=503, detail="Peer graph is not loaded")
 
-    if fast:
-        print(f"[Retrieve] {CLIENT_NAME} fast lookup for {drug_id} (skipping ML training)")
-        status, scored_paths, metrics = _fast_graph_retrieve(drug_id, task_type)
-        state_dict = LinkPredictor(task_type=task_type).state_dict()
-        return _build_retrieve_payload(
-            drug_id=drug_id,
-            task_type=task_type,
-            status=status,
-            scored_paths=scored_paths,
-            metrics=metrics,
-            state_dict=state_dict,
-            include_weights=False,
-        )
-
-    if CLIENT_STATE.last_valid_checkpoint:
-        print(
-            f"[Checkpoint Recovery] Node {CLIENT_NAME} serving {drug_id} "
-            f"on recovered baseline {CLIENT_STATE.last_valid_checkpoint}."
-        )
-    else:
-        print(
-            f"[Checkpoint Recovery] Node {CLIENT_NAME} serving {drug_id} "
-            "without a recovered baseline checkpoint."
-        )
-
-    print(
-        f"[Retrieve] {CLIENT_NAME} {task_type} training started for {drug_id}"
-    )
+    print(f"[Local Retrieve] {PEER_NAME} {task_type} training started for {drug_id}")
     local_model, metrics = train_model(drug_id, task_type=task_type)
     state_dict = local_model.state_dict()
-    print(f"[Retrieve] {CLIENT_NAME} training complete for {drug_id}")
+    print(f"[Local Retrieve] {PEER_NAME} training complete for {drug_id}")
 
     if drug_id not in G:
-        return _build_retrieve_payload(
+        return _build_local_payload(
             drug_id=drug_id,
             task_type=task_type,
             status="not_found",
@@ -485,7 +387,7 @@ def retrieve(
 
     targets = list(G.neighbors(drug_id))
     scored_paths = score_candidate_paths(local_model, drug_id, targets)
-    return _build_retrieve_payload(
+    return _build_local_payload(
         drug_id=drug_id,
         task_type=task_type,
         status="success",
@@ -496,14 +398,115 @@ def retrieve(
     )
 
 
+def _targets_to_evidence_paths(local_response: dict) -> list[dict]:
+    """Convert local scored targets into federated evidence path entries."""
+    evidence_paths = []
+    for target in local_response.get("targets", []):
+        if isinstance(target, dict):
+            evidence_path = {
+                "peer_id": PEER_NAME,
+                "path": target.get("path", "unknown"),
+            }
+            if "ml_score" in target:
+                evidence_path["ml_score"] = target["ml_score"]
+            evidence_paths.append(evidence_path)
+        else:
+            evidence_paths.append(
+                {
+                    "peer_id": PEER_NAME,
+                    "path": f"{local_response.get('drug_id', 'unknown')} -> {target}",
+                }
+            )
+    return evidence_paths
+
+
+def summarize_weights_lists(weights: dict) -> dict:
+    """Summarize serialized list weights without materializing huge tensors."""
+    summary: dict = {}
+    for layer_name, tensor_values in weights.items():
+        if not tensor_values:
+            summary[layer_name] = {"shape": [0]}
+        elif isinstance(tensor_values[0], list):
+            summary[layer_name] = {
+                "shape": [len(tensor_values), len(tensor_values[0])],
+            }
+        else:
+            summary[layer_name] = {"shape": [len(tensor_values)]}
+    return summary
+
+
+def sanitize_peer_response_for_api(response: dict) -> dict:
+    """Strip full weight tensors so browser/curl JSON stays small."""
+    sanitized = {key: value for key, value in response.items() if key != "model_weights"}
+    if "model_weights" in response and "model_weights_summary" not in sanitized:
+        sanitized["model_weights_summary"] = summarize_weights_lists(response["model_weights"])
+    return sanitized
+
+
+@app.get("/local_retrieve")
+def local_retrieve(
+    drug_id: str,
+    task_type: str = "classification",
+    include_weights: bool = False,
+) -> dict:
+    """Run the local PyTorch model on this peer's private graph partition."""
+    return run_local_retrieve(drug_id, task_type=task_type, include_weights=include_weights)
+
+
+@app.get("/global_retrieve")
+def global_retrieve(
+    drug_id: str,
+    task_type: str = "classification",
+) -> dict:
+    """Initiate a federated query from this peer (local-only until DHT routing lands)."""
+    query_id = str(uuid.uuid4())
+    local_response = run_local_retrieve(
+        drug_id,
+        task_type=task_type,
+        include_weights=True,
+    )
+    sanitized_local = sanitize_peer_response_for_api(local_response)
+
+    status = local_response.get("status", "unknown")
+    available_peers = [PEER_NAME] if status in ("success", "not_found") else []
+    missing_peers = [] if available_peers else [PEER_NAME]
+    completeness_score = f"{len(available_peers)}/1"
+    evidence_paths = _targets_to_evidence_paths(local_response)
+    peer_metrics = local_response.get("metrics")
+    local_confidence = float(local_response.get("local_confidence", 0.0))
+    weights_summary = sanitized_local.get("model_weights_summary", {})
+
+    return {
+        "query": drug_id,
+        "task_type": task_type,
+        "query_id": query_id,
+        "initiator_peer": PEER_NAME,
+        "completeness_score": completeness_score,
+        "retrieval_confidence_score": f"{int(local_confidence * 100)}%",
+        "available_peers": available_peers,
+        "available_clients": available_peers,
+        "missing_peers": missing_peers,
+        "missing_clients": missing_peers,
+        "evidence_paths_count": len(evidence_paths),
+        "evidence_paths": evidence_paths,
+        "peer_link_prediction_metrics": {PEER_NAME: peer_metrics} if peer_metrics else {},
+        "client_link_prediction_metrics": {PEER_NAME: peer_metrics} if peer_metrics else {},
+        "global_aggregated_model": weights_summary,
+        "raw_responses": [sanitized_local],
+        "routing_mode": "local_only",
+        "note": "P2P DHT propagation not yet implemented; only initiator peer queried.",
+    }
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run a federated graph client API.")
+    parser = argparse.ArgumentParser(description="Run a hybrid P2P peer node.")
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--file", type=str, required=True)
-    parser.add_argument("--name", type=str, default="Client_1")
+    parser.add_argument("--name", type=str, default="Peer_1")
     args = parser.parse_args()
 
-    load_client_graph(args.file)
-    CLIENT_NAME = args.name
+    PEER_NAME = args.name
+    load_peer_graph(args.file, peer_name=PEER_NAME)
 
+    print(f"[Peer Node] Starting {PEER_NAME} on port {args.port}")
     uvicorn.run(app, host="0.0.0.0", port=args.port)
