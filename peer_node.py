@@ -553,6 +553,88 @@ def sanitize_peer_response_for_api(response: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# FedAvg aggregation helpers
+# ---------------------------------------------------------------------------
+
+def aggregate_models(client_weights_list: list[dict]) -> dict:
+    """Federated Averaging (FedAvg) over a list of serialized PyTorch state dicts.
+
+    Each value in the state dict is a plain Python list (tensor serialized via
+    ``state_dict_to_lists``).  We perform an element-wise mean across all peers
+    and return the averaged state dict in the same list format.
+
+    Args:
+        client_weights_list: List of state dicts, each mapping layer name to a
+                             nested list of floats.
+
+    Returns:
+        Averaged state dict (same structure), or empty dict if input is empty.
+    """
+    if not client_weights_list:
+        return {}
+
+    # Use first client's keys as reference
+    reference = client_weights_list[0]
+    aggregated: dict = {}
+
+    for layer_name, ref_tensor in reference.items():
+        # Collect the same layer from every peer
+        all_tensors = []
+        for weights in client_weights_list:
+            t = weights.get(layer_name)
+            if t is not None:
+                all_tensors.append(t)
+
+        if not all_tensors:
+            aggregated[layer_name] = ref_tensor
+            continue
+
+        n = len(all_tensors)
+
+        # 2-D tensor (e.g. embedding or linear weight matrix)
+        if isinstance(ref_tensor[0], list):
+            rows = len(ref_tensor)
+            cols = len(ref_tensor[0])
+            avg = [
+                [
+                    sum(all_tensors[p][r][c] for p in range(n)) / n
+                    for c in range(cols)
+                ]
+                for r in range(rows)
+            ]
+        else:
+            # 1-D tensor (bias / output layer)
+            avg = [
+                sum(all_tensors[p][i] for p in range(n)) / n
+                for i in range(len(ref_tensor))
+            ]
+
+        aggregated[layer_name] = avg
+
+    return aggregated
+
+
+def summarize_state_dict_lists(state_dict: dict) -> dict:
+    """Convert an aggregated list-based state dict into human-readable shape info."""
+    summary: dict = {}
+    for layer_name, tensor_values in state_dict.items():
+        if not tensor_values:
+            summary[layer_name] = {"shape": [0]}
+        elif isinstance(tensor_values[0], list):
+            summary[layer_name] = {
+                "shape": [len(tensor_values), len(tensor_values[0])],
+            }
+        else:
+            summary[layer_name] = {"shape": [len(tensor_values)]}
+    return summary
+
+
+def sanitize_raw_responses_for_api(raw_responses: list[dict]) -> list[dict]:
+    """Strip model_weights from every response in the list, replacing with shape summary."""
+    return [sanitize_peer_response_for_api(r) for r in raw_responses]
+
+
+# ---------------------------------------------------------------------------
 # Membership endpoints
 # ---------------------------------------------------------------------------
 
@@ -928,10 +1010,13 @@ async def global_retrieve(
     task_type: str = "classification",
     ttl: int = 2,
 ) -> dict:
-    """Initiate a federated query propagating via the DHT overlay network."""
+    """Initiate a federated DHT query, aggregate results via FedAvg, return summary."""
     query_id = str(uuid.uuid4())
-    print(f"[DHT] Initiating global query={query_id[:8]} for drug={drug_id}")
+    print(f"[FedAvg] Initiating global query={query_id[:8]} for drug={drug_id}")
 
+    # -----------------------------------------------------------------------
+    # Step 1: DHT propagation — collect raw responses from all reachable peers
+    # -----------------------------------------------------------------------
     raw_responses = await dht_retrieve_internal(
         drug_id=drug_id,
         task_type=task_type,
@@ -940,33 +1025,115 @@ async def global_retrieve(
         visited_peers=[]
     )
 
-    available_peers = [r.get("peer_id") for r in raw_responses if r.get("status") in ("success", "not_found")]
-    evidence_paths = []
-    peer_metrics = {}
+    # -----------------------------------------------------------------------
+    # Step 2: Collect inputs from raw responses
+    # -----------------------------------------------------------------------
+    client_weights_list: list[dict] = []
+    peer_metrics: dict = {}
+    evidence_paths: list = []
+    available_peers: list = []
+    missing_peers: list = []
+    confidence_scores: list[float] = []
+    local_update_id = None
+
     for resp in raw_responses:
         p_id = resp.get("peer_id", "unknown")
-        evidence_paths.extend(_targets_to_evidence_paths(resp))
-        if resp.get("metrics"):
-            peer_metrics[p_id] = resp["metrics"]
+        status = resp.get("status", "unknown")
 
-    local_update_id = None
-    for resp in raw_responses:
+        if status in ("success", "not_found"):
+            available_peers.append(p_id)
+        else:
+            missing_peers.append(p_id)
+
+        # Collect model weights for FedAvg
+        weights = resp.get("model_weights")
+        if weights:
+            client_weights_list.append(weights)
+
+        # Collect per-peer metrics
+        m = resp.get("metrics")
+        if m:
+            peer_metrics[p_id] = m
+
+        # Collect evidence paths (drug->target paths)
+        evidence_paths.extend(_targets_to_evidence_paths(resp))
+
+        # Collect confidence scores
+        conf = resp.get("local_confidence")
+        if conf is not None:
+            confidence_scores.append(float(conf))
+
+        # Track local node's update_id for CRDT reference
         if resp.get("peer_id") == PEER_NAME:
             local_update_id = resp.get("update_id")
+
+    # Completeness: how many peers responded vs total known peers (self + KNOWN_PEERS)
+    total_network_size = 1 + len(KNOWN_PEERS)  # self + known
+    completeness_score = f"{len(available_peers)}/{total_network_size}"
+
+    # -----------------------------------------------------------------------
+    # Step 3: FedAvg — element-wise average of all collected weights
+    # -----------------------------------------------------------------------
+    fedavg_weights = aggregate_models(client_weights_list)
+    global_aggregated_model = summarize_state_dict_lists(fedavg_weights)
+    print(
+        f"[FedAvg] Aggregated {len(client_weights_list)} weight sets. "
+        f"Layers: {list(global_aggregated_model.keys())[:3]}..."
+    )
+
+    # -----------------------------------------------------------------------
+    # Step 4: Global confidence — average across all responding peers
+    # -----------------------------------------------------------------------
+    global_confidence = (
+        round(sum(confidence_scores) / len(confidence_scores), 4)
+        if confidence_scores else 0.0
+    )
+
+    # -----------------------------------------------------------------------
+    # Step 5: Federated metrics — average per-metric across all peers
+    # -----------------------------------------------------------------------
+    federated_metrics: dict = {}
+    if peer_metrics:
+        if task_type == "classification":
+            metric_keys = ["precision", "recall", "f1_score", "top_50_precision"]
+        else:
+            metric_keys = ["mse", "r2"]
+
+        for key in metric_keys:
+            vals = [
+                m[key] for m in peer_metrics.values()
+                if key in m and m[key] is not None
+            ]
+            if vals:
+                federated_metrics[key] = round(sum(vals) / len(vals), 4)
+
+    print(
+        f"[FedAvg] Federated metrics ({task_type}): {federated_metrics} "
+        f"(global_confidence={global_confidence})"
+    )
+
+    # -----------------------------------------------------------------------
+    # Step 6: Sanitize raw responses (strip heavy weight arrays)
+    # -----------------------------------------------------------------------
+    sanitized_responses = sanitize_raw_responses_for_api(raw_responses)
 
     return {
         "query": drug_id,
         "task_type": task_type,
         "query_id": query_id,
         "initiator_peer": PEER_NAME,
+        "completeness_score": completeness_score,
+        "global_confidence": global_confidence,
         "available_peers": available_peers,
+        "missing_peers": missing_peers,
         "evidence_paths_count": len(evidence_paths),
         "evidence_paths": evidence_paths,
         "peer_link_prediction_metrics": peer_metrics,
-        "raw_responses": raw_responses,
+        "federated_link_prediction_metrics": federated_metrics,
+        "global_aggregated_model": global_aggregated_model,
+        "raw_responses": sanitized_responses,
         "routing_mode": "dht_propagation",
         "crdt_update_id": local_update_id,
-        "note": "DHT propagation complete. FedAvg math will be added in Commit 6.",
     }
 
 
