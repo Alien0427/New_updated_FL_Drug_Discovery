@@ -1,10 +1,14 @@
 """Hybrid P2P peer: local graph client and federated query initiator."""
 
 import argparse
+import asyncio
 import hashlib
 import random
 import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
+import httpx
 import networkx as nx
 import torch
 import torch.nn as nn
@@ -36,7 +40,74 @@ REGRESSION_HIGH_AFFINITY = (5.0, 10.0)
 REGRESSION_LOW_AFFINITY = (0.0, 3.0)
 REGRESSION_SCORE_THRESHOLD = 5.0
 
-app = FastAPI(title="Hybrid P2P Peer Node")
+# ---------------------------------------------------------------------------
+# Peer Membership State
+# Key   : peer base URL  (e.g. "http://localhost:8002")
+# Value : {"last_seen": ISO-8601 str | None, "status": "active" | "offline"}
+# ---------------------------------------------------------------------------
+KNOWN_PEERS: dict[str, dict] = {}
+
+HEARTBEAT_INTERVAL_SECONDS = 10
+HEARTBEAT_TIMEOUT_SECONDS = 3
+
+
+# ---------------------------------------------------------------------------
+# Background heartbeat
+# ---------------------------------------------------------------------------
+
+async def heartbeat_loop() -> None:
+    """Continuously ping every known peer every HEARTBEAT_INTERVAL_SECONDS seconds.
+
+    Only logs state *changes* (online->offline or offline->online) to avoid
+    flooding the console during normal operation.
+    """
+    print("[Heartbeat] Background task started.")
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+        if not KNOWN_PEERS:
+            continue
+
+        async with httpx.AsyncClient() as client:
+            for url, peer_info in list(KNOWN_PEERS.items()):
+                previous_status = peer_info.get("status", "offline")
+                try:
+                    resp = await client.get(
+                        f"{url}/ping",
+                        timeout=HEARTBEAT_TIMEOUT_SECONDS,
+                    )
+                    resp.raise_for_status()
+                    now = datetime.now(timezone.utc).isoformat()
+                    KNOWN_PEERS[url]["last_seen"] = now
+                    KNOWN_PEERS[url]["status"] = "active"
+                    if previous_status != "active":
+                        print(f"[Heartbeat] [ONLINE] Peer back ONLINE: {url}")
+                except (httpx.TimeoutException, httpx.ConnectError, Exception):
+                    KNOWN_PEERS[url]["status"] = "offline"
+                    if previous_status != "offline":
+                        print(f"[Heartbeat] [OFFLINE] Peer went OFFLINE: {url}")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI lifespan: start/stop the heartbeat background task
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application startup and shutdown lifecycle."""
+    task = asyncio.create_task(heartbeat_loop())
+    print("[Lifespan] Heartbeat task created.")
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        print("[Lifespan] Heartbeat task stopped.")
+
+
+app = FastAPI(title="Hybrid P2P Peer Node", lifespan=lifespan)
 
 
 def load_peer_graph(graph_path: str, peer_name: str | None = None) -> None:
@@ -442,6 +513,61 @@ def sanitize_peer_response_for_api(response: dict) -> dict:
         sanitized["model_weights_summary"] = summarize_weights_lists(response["model_weights"])
     return sanitized
 
+
+# ---------------------------------------------------------------------------
+# Membership endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/ping")
+def ping() -> dict:
+    """Health-check / heartbeat target. Returns this peer's live identity."""
+    return {
+        "status": "alive",
+        "peer_id": PEER_NAME,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.post("/add_peer")
+def add_peer(url: str) -> dict:
+    """Manually register a peer URL into this node's membership list.
+
+    Args:
+        url: Base URL of the peer to register, e.g. ``http://localhost:8002``.
+    """
+    url = url.rstrip("/")
+    if url in KNOWN_PEERS:
+        return {
+            "result": "already_known",
+            "url": url,
+            "peer_info": KNOWN_PEERS[url],
+        }
+
+    KNOWN_PEERS[url] = {
+        "last_seen": None,
+        "status": "active",
+    }
+    print(f"[Membership] [+] New peer added: {url} (total known: {len(KNOWN_PEERS)})")
+    return {
+        "result": "added",
+        "url": url,
+        "total_known_peers": len(KNOWN_PEERS),
+    }
+
+
+@app.get("/peers")
+def list_peers() -> dict:
+    """Return the current peer membership list with status information."""
+    return {
+        "self": PEER_NAME,
+        "total_known": len(KNOWN_PEERS),
+        "peers": KNOWN_PEERS,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Retrieval endpoints
+# ---------------------------------------------------------------------------
 
 @app.get("/local_retrieve")
 def local_retrieve(
