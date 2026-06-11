@@ -155,10 +155,61 @@ async def heartbeat_loop() -> None:
                         print(f"[Heartbeat] [OFFLINE] Peer went OFFLINE: {url}")
 
 
+# ---------------------------------------------------------------------------
+# Background Anti-Entropy CRDT Gossip Loop
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# FastAPI lifespan: start/stop the heartbeat background task
-# ---------------------------------------------------------------------------
+async def crdt_gossip_loop() -> None:
+    """Anti-entropy background loop: periodically push-pull CRDT ledger with a random peer.
+
+    Every 15 seconds this loop:
+    - Selects one random ACTIVE peer from KNOWN_PEERS.
+    - POSTs the local CRDT_LEDGER to that peer's /crdt_sync endpoint.
+    - Receives the peer's own ledger in return and merges any new events
+      (LWW strategy via merge_crdt_event).
+
+    15s interval offsets from the 10s heartbeat to avoid network spikes.
+    """
+    GOSSIP_INTERVAL_SECONDS = 15
+    print("[Gossip] Anti-entropy CRDT gossip task started.")
+    while True:
+        await asyncio.sleep(GOSSIP_INTERVAL_SECONDS)
+
+        active_peers = [
+            url for url, info in KNOWN_PEERS.items()
+            if info.get("status") == "active"
+        ]
+        if not active_peers:
+            continue
+
+        peer_url = random.choice(active_peers)
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{peer_url}/crdt_sync",
+                    json=CRDT_LEDGER,
+                    timeout=5.0,
+                )
+                resp.raise_for_status()
+                remote_ledger: dict = resp.json().get("ledger", {})
+
+                # Pull-merge: absorb any events the remote peer knew that we didn't
+                pulled = 0
+                for update_id, payload in remote_ledger.items():
+                    if isinstance(payload, dict) and merge_crdt_event(update_id, payload):
+                        pulled += 1
+
+                if pulled > 0 or len(CRDT_LEDGER) > 0:
+                    print(
+                        f"[Gossip] Synced CRDT with {peer_url}. "
+                        f"Pulled {pulled} new events. Local ledger size: {len(CRDT_LEDGER)}"
+                    )
+        except Exception as exc:
+            # Gossip failures are non-critical — just log and continue
+            print(f"[Gossip] WARNING: Sync with {peer_url} failed: {type(exc).__name__}")
+
+
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -212,17 +263,21 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             print(f"[Bootstrap] WARNING: Could not contact {BOOTSTRAP_PEER}: {exc}")
 
-    task = asyncio.create_task(heartbeat_loop())
+    task_heartbeat = asyncio.create_task(heartbeat_loop())
+    task_gossip = asyncio.create_task(crdt_gossip_loop())
     print("[Lifespan] Heartbeat task created.")
+    print("[Lifespan] CRDT gossip task created.")
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        print("[Lifespan] Heartbeat task stopped.")
+        task_heartbeat.cancel()
+        task_gossip.cancel()
+        for t in (task_heartbeat, task_gossip):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        print("[Lifespan] Background tasks stopped.")
 
 
 app = FastAPI(title="Hybrid P2P Peer Node", lifespan=lifespan)
@@ -940,13 +995,14 @@ def check_if_duplicate(update_id: str) -> bool:
 
 @app.post("/crdt_sync")
 def crdt_sync(incoming_ledger: dict) -> dict:
-    """Merge an incoming CRDT ledger from a remote peer (gossip receiver).
+    """Merge an incoming CRDT ledger from a remote peer (push-pull gossip receiver).
 
     Accepts a JSON dict mapping update_id -> event payload and applies
-    the LWW merge strategy to each entry.
+    the LWW merge strategy to each entry.  Returns the **local ledger** so
+    the caller can pull-merge any events it had not yet seen.
 
     Returns:
-        A summary of merged vs. ignored event counts.
+        Merge summary plus the full local CRDT_LEDGER for the caller to pull.
     """
     merged = 0
     ignored = 0
@@ -970,6 +1026,7 @@ def crdt_sync(incoming_ledger: dict) -> dict:
         "merged": merged,
         "ignored": ignored,
         "ledger_size": len(CRDT_LEDGER),
+        "ledger": CRDT_LEDGER,   # Return own ledger so caller can pull-merge
     }
 
 
