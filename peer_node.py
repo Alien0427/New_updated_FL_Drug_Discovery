@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from sklearn.metrics import (
     f1_score,
     mean_squared_error,
@@ -25,6 +26,7 @@ from sklearn.metrics import (
 
 G = None
 PEER_NAME = "Unknown"
+PEER_PORT = 8001
 MODEL_VERSION = "v1.0.0"
 
 NODE_TO_IDX: dict = {}
@@ -507,10 +509,11 @@ def run_local_retrieve(
 def _targets_to_evidence_paths(local_response: dict) -> list[dict]:
     """Convert local scored targets into federated evidence path entries."""
     evidence_paths = []
+    p_id = local_response.get("peer_id", PEER_NAME)
     for target in local_response.get("targets", []):
         if isinstance(target, dict):
             evidence_path = {
-                "peer_id": PEER_NAME,
+                "peer_id": p_id,
                 "path": target.get("path", "unknown"),
             }
             if "ml_score" in target:
@@ -519,7 +522,7 @@ def _targets_to_evidence_paths(local_response: dict) -> list[dict]:
         else:
             evidence_paths.append(
                 {
-                    "peer_id": PEER_NAME,
+                    "peer_id": p_id,
                     "path": f"{local_response.get('drug_id', 'unknown')} -> {target}",
                 }
             )
@@ -793,36 +796,34 @@ def local_retrieve(
     return run_local_retrieve(drug_id, task_type=task_type, include_weights=include_weights)
 
 
-@app.get("/global_retrieve")
-def global_retrieve(
+class DHTRetrieveRequest(BaseModel):
+    drug_id: str
+    task_type: str = "classification"
+    query_id: str
+    ttl: int
+    visited_peers: list[str] = []
+
+
+async def dht_retrieve_internal(
     drug_id: str,
-    task_type: str = "classification",
-) -> dict:
-    """Initiate a federated query from this peer (local-only until DHT routing lands)."""
-    query_id = str(uuid.uuid4())
+    task_type: str,
+    query_id: str,
+    ttl: int,
+    visited_peers: list[str]
+) -> list[dict]:
+    """Internal DHT query propagation logic."""
+    my_url = f"http://localhost:{PEER_PORT}"
+
+    # Step A (Local Work)
     local_response = run_local_retrieve(
         drug_id,
         task_type=task_type,
         include_weights=True,
     )
-    sanitized_local = sanitize_peer_response_for_api(local_response)
 
-    status = local_response.get("status", "unknown")
-    available_peers = [PEER_NAME] if status in ("success", "not_found") else []
-    missing_peers = [] if available_peers else [PEER_NAME]
-    completeness_score = f"{len(available_peers)}/1"
-    evidence_paths = _targets_to_evidence_paths(local_response)
-    peer_metrics = local_response.get("metrics")
-    local_confidence = float(local_response.get("local_confidence", 0.0))
-    weights_summary = sanitized_local.get("model_weights_summary", {})
-
-    # ------------------------------------------------------------------
-    # CRDT commit: record this FL round event in the local ledger
-    # ------------------------------------------------------------------
+    # Log/Commit to local CRDT ledger
     update_id = local_response.get("update_id", str(uuid.uuid4()))
-    if check_if_duplicate(update_id):
-        print(f"[CRDT] Duplicate update_id detected: {update_id} — skipping re-commit")
-    else:
+    if not check_if_duplicate(update_id):
         crdt_payload = {
             "status": "update_committed",
             "timestamp": time.time(),
@@ -831,26 +832,141 @@ def global_retrieve(
         merge_crdt_event(update_id, crdt_payload)
         print(f"[CRDT] Committed update_id={update_id[:8]}... ledger_size={len(CRDT_LEDGER)}")
 
+    # Add own base URL to visited list
+    updated_visited = list(visited_peers)
+    if my_url not in updated_visited:
+        updated_visited.append(my_url)
+
+    # Step B (Propagation)
+    forward_results = []
+    if ttl > 0:
+        # Calculate target ID from drug_id SHA-256 hash
+        target_id_hex = hashlib.sha256(drug_id.encode("utf-8")).hexdigest()
+        target_id_int = int(target_id_hex, 16)
+
+        # Build candidates list (self + active known peers)
+        candidates = []
+        for url, info in KNOWN_PEERS.items():
+            if info.get("status") != "active":
+                continue
+            peer_node_id = info.get("node_id")
+            if peer_node_id is None:
+                continue
+            candidates.append({
+                "url": url,
+                "node_id": peer_node_id,
+                "xor_distance": calculate_xor_distance(peer_node_id, target_id_int)
+            })
+
+        # Sort candidates by XOR distance
+        candidates.sort(key=lambda c: c["xor_distance"])
+
+        # Filter out already visited peers
+        to_forward = [c for c in candidates if c["url"] not in updated_visited]
+
+        # Pick top 2 closest remaining peers
+        targets = to_forward[:2]
+
+        if targets:
+            print(f"[DHT] {PEER_NAME} forwarding query {query_id[:8]} to: {[t['url'] for t in targets]} (ttl={ttl})")
+
+            # Add all target URLs we are querying to visited_peers to prevent loopback/cross-querying
+            next_visited = list(updated_visited)
+            for t in targets:
+                if t["url"] not in next_visited:
+                    next_visited.append(t["url"])
+
+            async def forward_to_peer(peer_url: str):
+                try:
+                    async with httpx.AsyncClient() as client:
+                        response = await client.post(
+                            f"{peer_url}/dht_retrieve",
+                            json={
+                                "drug_id": drug_id,
+                                "task_type": task_type,
+                                "query_id": query_id,
+                                "ttl": ttl - 1,
+                                "visited_peers": next_visited
+                            },
+                            timeout=30.0
+                        )
+                        if response.status_code == 200:
+                            return response.json()
+                        else:
+                            print(f"[DHT] Failed to query {peer_url}, status code: {response.status_code}")
+                            return []
+                except Exception as e:
+                    print(f"[DHT] Error querying {peer_url}: {e}")
+                    return []
+
+            tasks = [forward_to_peer(t["url"]) for t in targets]
+            gathered = await asyncio.gather(*tasks)
+            for g in gathered:
+                if isinstance(g, list):
+                    forward_results.extend(g)
+
+    # Step C (Bubble Up)
+    return [local_response] + forward_results
+
+
+@app.post("/dht_retrieve")
+async def dht_retrieve(request: DHTRetrieveRequest) -> list[dict]:
+    """Internal DHT query propagation endpoint."""
+    print(f"[DHT] Received /dht_retrieve for drug={request.drug_id} (ttl={request.ttl})")
+    return await dht_retrieve_internal(
+        drug_id=request.drug_id,
+        task_type=request.task_type,
+        query_id=request.query_id,
+        ttl=request.ttl,
+        visited_peers=request.visited_peers
+    )
+
+
+@app.get("/global_retrieve")
+async def global_retrieve(
+    drug_id: str,
+    task_type: str = "classification",
+    ttl: int = 2,
+) -> dict:
+    """Initiate a federated query propagating via the DHT overlay network."""
+    query_id = str(uuid.uuid4())
+    print(f"[DHT] Initiating global query={query_id[:8]} for drug={drug_id}")
+
+    raw_responses = await dht_retrieve_internal(
+        drug_id=drug_id,
+        task_type=task_type,
+        query_id=query_id,
+        ttl=ttl,
+        visited_peers=[]
+    )
+
+    available_peers = [r.get("peer_id") for r in raw_responses if r.get("status") in ("success", "not_found")]
+    evidence_paths = []
+    peer_metrics = {}
+    for resp in raw_responses:
+        p_id = resp.get("peer_id", "unknown")
+        evidence_paths.extend(_targets_to_evidence_paths(resp))
+        if resp.get("metrics"):
+            peer_metrics[p_id] = resp["metrics"]
+
+    local_update_id = None
+    for resp in raw_responses:
+        if resp.get("peer_id") == PEER_NAME:
+            local_update_id = resp.get("update_id")
+
     return {
         "query": drug_id,
         "task_type": task_type,
         "query_id": query_id,
         "initiator_peer": PEER_NAME,
-        "completeness_score": completeness_score,
-        "retrieval_confidence_score": f"{int(local_confidence * 100)}%",
         "available_peers": available_peers,
-        "available_clients": available_peers,
-        "missing_peers": missing_peers,
-        "missing_clients": missing_peers,
         "evidence_paths_count": len(evidence_paths),
         "evidence_paths": evidence_paths,
-        "peer_link_prediction_metrics": {PEER_NAME: peer_metrics} if peer_metrics else {},
-        "client_link_prediction_metrics": {PEER_NAME: peer_metrics} if peer_metrics else {},
-        "global_aggregated_model": weights_summary,
-        "raw_responses": [sanitized_local],
-        "routing_mode": "local_only",
-        "crdt_update_id": update_id,
-        "note": "P2P DHT propagation not yet implemented; only initiator peer queried.",
+        "peer_link_prediction_metrics": peer_metrics,
+        "raw_responses": raw_responses,
+        "routing_mode": "dht_propagation",
+        "crdt_update_id": local_update_id,
+        "note": "DHT propagation complete. FedAvg math will be added in Commit 6.",
     }
 
 
@@ -862,6 +978,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     PEER_NAME = args.name
+    PEER_PORT = args.port
 
     # Generate stable DHT node ID from peer identity
     NODE_ID, NODE_ID_HEX = _generate_node_id(PEER_NAME, args.port)
